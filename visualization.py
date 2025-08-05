@@ -12,8 +12,8 @@ load_dotenv(override=True)
 class Visualization:
     def __init__(self):
         self.driver = GraphDatabase.driver(
-            os.getenv["NEO4J_URI"],
-            auth=(os.getenv["NEO4J_USERNAME"], os.getenv["NEO4J_PASSWORD"])
+            os.getenv("NEO4J_URI"),
+            auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
         )
         self.query = None
         self.graph = None
@@ -26,7 +26,7 @@ class Visualization:
             result = session.run(query)
             return result.graph()
 
-    def show_general_graph(self, query: str, save_path: Optional[str], shown: bool = False):
+    def show_general_graph(self, query: str, save_path: Optional[str] = None, shown: bool = False):
         graph_data = self.execute_query(query=query)
         self.query = query
         G = nx.MultiDiGraph()
@@ -133,3 +133,20 @@ class Visualization:
         for bar, color in zip(bars, colors):
             bar.set_color(color)
         plt.show()
+    
+    def show_shortest_path(self, start_node: str, end_node: str):
+        if start_node not in self.id_to_names or end_node not in self.id_to_names:
+            print("Invalid node names")
+            return ""
+        
+        shortest_path = nx.shortest_path(self.graph, source= start_node, target= end_node)
+        H = self.graph.subgraph(shortest_path)
+        H_named = nx.relabel_nodes(H, self.id_to_names, copy = True)
+
+        edge_map = cm.get_cmap('viridis')
+        pos = nx.spring_layout(H_named)
+        nx.draw_networkx(H_named, pos, with_labels=True,font_size=10, node_size=700, node_color='lightblue',edge_cmap= edge_map ,edge_color='gray', alpha=0.6)
+        plt.title("Shortest Path Visualization")
+        plt.show()
+ 
+    
