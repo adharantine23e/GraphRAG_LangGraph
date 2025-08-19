@@ -1,20 +1,126 @@
 import os 
 import re
+import json
+import pandas as pd
 from unidecode import unidecode
 from typing import List, Any, Dict, Tuple
 from neo4j import GraphDatabase, Session
 import logging
+from contextlib import contextmanager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def normalized_string(value: str) -> str:
+    return "".join(value.split("_")).lower()
+
+
+def find_relative_type(data_table: pd.DataFrame) -> Dict[str, List[str]]:
+    grouped_dict = {}
+    for i in range(len(data_table)):
+        normalized_value = normalized_string(data_table['relationship_type'][i])
+        if normalized_value not in grouped_dict:
+            grouped_dict[normalized_value] = []
+        grouped_dict[normalized_value].append(data_table['relationship_type'][i])
+    return grouped_dict
+
+def replace_relationship(session: Session, relationship_dict: Dict[Any]) -> Tuple[int, List[str], List[str]]:
+    index = 0
+    key_process = []
+    relationship_being_ignored = []
+    for key, value in relationship_dict.items():
+        if len(value) >1:
+            text_to_replace = min(value, key= lambda x:x.count("_"))
+            text_to_inflect = max(value, key= lambda x:x.count("_"))
+            print("Processing relationship: ", key)
+            print("<><><><><><><><><><><><><><><><>")
+
+            replace_dict = find_relationship(session, text_to_replace)
+            if len(replace_dict) == 0:
+                print("Value being ingnored: ",text_to_replace)
+                relationship_being_ignored.append(key)
+                continue
+            index +=1
+            key_process.append(key)
+            for item in replace_dict:
+                print("Processing item: ", item['projected_id'])
+                connect_cypher = f'''
+                MATCH (n:`{item['projected_labels'][0]}` {{id: '{item['projected_id']}'}})-[r:{text_to_replace}]->(m:`{item['incoming_labels'][0]}` {{id: "{item['incoming_id']}"}})
+                CREATE (n)-[r2:{text_to_inflect}]->(m)
+                SET r2 += properties(r)
+                WITH r
+                DELETE r
+
+            '''
+                print("Running the cypher...")
+                session.run(connect_cypher)
+            print(f"Complete delete relation: {text_to_replace} and create relation: {text_to_inflect}")
+            print("###################")
+    return index, key_process, relationship_being_ignored
+
+def find_relationship(session: Session, relationship_type):
+    default_cypher = '''
+    MATCH (n)-[r:{r}]->(k)
+    RETURN n.id as projected_id, labels(n) as projected_labels, type(r) as relationship, k.id as incoming_id, labels(k) as incoming_labels
+    '''.format(r=relationship_type)
+    result = session.run(default_cypher)
+    data = []
+
+    for record in result:
+        list_value = {}
+        list_value['projected_id'] = record['projected_id']
+        list_value['projected_labels']= record['projected_labels']
+        list_value['relationship'] = record['relationship']
+        list_value['incoming_id'] = record['incoming_id']
+        list_value['incoming_labels'] = record['incoming_labels']
+        data.append(list_value)
+    return data
+
+def check_for_Vietnamese(text: str) -> bool:
+    vietnamese_pattern = r"[ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠàáâãèéêìíòóôõùúăđĩũơƯĂẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼỀỀỂưăạảấầẩẫậắằẳẵặẹẻẽềềểỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪễếệỉịọỏốồổỗộớờởỡợụủứừỬỮỰỲỴÝỶỸửữựỳỵỷỹ]+"
+
+    # Pattern for valid characters (including English letters, digits, and underscores)
+    valid_characters_pattern = r"^[a-zA-Z0-9_ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠàáâãèéêìíòóôõùúăđĩũơƯĂẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼỀỀỂưăạảấầẩẫậắằẳẵặẹẻẽềềểỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪễếệỉịọỏốồổỗộớờởỡợụủứừỬỮỰỲỴÝỶỸửữựỳỵỷỹ_]+$"
+    if re.fullmatch(valid_characters_pattern, text) and re.search(vietnamese_pattern, text):
+        return True
+    else:
+        return False
+    
+def levenshtein_distance(s1: str, s2: str) -> int:
+    if len(s1) < len(s2):
+        s1, s2 = s2, s1  # Ensure s1 is the longer string
+    if len(s2) == 0:
+        return len(s1)
+
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+
+    return previous_row[len(s2)]
+
 
 class GraphPreprocessor:
     def __init__(self, driver: GraphDatabase.driver):
         self.driver = driver
         self.exception_nodes_ascii = None
+
+    @contextmanager
+    def get_session(self):
+        """Context manager for Neo4j sessions"""
+        session = self.driver.session()
+        try:
+            yield session
+        finally:
+            session.close()
+
 
     def load_list_except_ascii(self, path: str = r"data\exception_underscore_ascii.txt") -> List[str]:
         with open(path, "r") as f:
@@ -246,7 +352,7 @@ class GraphPreprocessor:
                 rels_group[rel_type] = []
             rels_group[rel_type].append(transfer)
         
-        for rel_type, transfers in rels_group.item():
+        for rel_type, transfers in rels_group.items():
             clean_rel_type = rel_type.replace("-", "_") if rel_type and "-" in rel_type else rel_type
             outgoing = [t for t in transfers if t['direction'] == 'outgoing']
             incoming = [t for t in transfers if t['direction'] == 'incoming']
@@ -280,7 +386,7 @@ class GraphPreprocessor:
                     } for t in incoming
                 ])
 
-    def delete_node_batch(session: Session, nodes_list: List[Tuple[str, str]]):
+    def delete_node_batch(self, session: Session, nodes_list: List[Tuple[str, str]]):
         if not nodes_list:
             pass
         query = '''
@@ -355,6 +461,39 @@ class GraphPreprocessor:
                         '''
                         session.run(connect_cypher_inward)
     
+    def cacl_missing_rels(self, main_node: Dict[str, Any], replacement_node: Dict[str, Any], replacement_id: str) -> List[Dict[str, Any]]:
+        main_connected_nodes = set()
+        for rel in main_node['outgoing_relationships'] + main_node['incoming_relationships']:
+            if rel['related_node_id']:
+                main_connected_nodes.add(rel['related_node_id'])
+        
+        replacement_connected_nodes = set()
+        for rel in replacement_node['outgoing_relationships'] + replacement_node['incoming_relationships']:
+            if rel['related_node_id']:
+                main_connected_nodes.add(rel['related_node_id'])
+
+        missing_connections = main_connected_nodes - replacement_connected_nodes
+
+        # Relationship transfer
+        rels_transfer = []
+        for rel in main_node['outgoing_relationships'] + main_node['incoming_relationships']:
+            if rel['related_node_id'] in missing_connections:
+                if rel['direction'] == 'outgoing':
+                    rels_transfer.append({
+                        'relationship_type': rel['relationship_type'],
+                        'source_id': replacement_id,
+                        'target_id': rel['related_node_id'],
+                        'direction': 'outgoing'  
+                    })
+                else:
+                    rels_transfer.append({
+                        'relationship_type': rel['relationship_type'],
+                        'source_id': rel['related_node_id'],
+                        'target_id': replacement_id,
+                        'direction': 'incoming'  
+                    })
+        return rels_transfer
+
     def process_nodes_non_ascii_underscore(self, session: Session):
         logger.info("Processing Vietnamese nodes")
 
@@ -398,35 +537,9 @@ class GraphPreprocessor:
             if not replacement_relationships:
                 continue
 
-            main_connected_nodes = set()
-            for rel in main_relationships['outgoing_relationships'] + main_relationships['incoming_relationships']:
-                if rel['related_node_id']:
-                    main_connected_nodes.add(rel['related_node_id'])
-            
-            replacement_connected_nodes = set()
-            for rel in replacement_relationships['outgoing_relationships'] + replacement_relationships['incoming_relationships']:
-                if rel['related_node_id']:
-                    main_connected_nodes.add(rel['related_node_id'])
-            missing_connections = main_connected_nodes - replacement_connected_nodes
-
-            # Relationship transfer
-            for rel in main_relationships['outgoing_relationships'] + main_relationships['incoming_relationships']:
-                if rel['related_node_id'] in missing_connections:
-                    if rel['direction'] == 'outgoing':
-                        relationship_noascii_transfer.append({
-                            'relationship_type': rel['relationship_type'],
-                            'source_id': replacement_id,
-                            'target_id': rel['related_node_id'],
-                            'direction': 'outgoing'  
-                        })
-                    else:
-                        relationship_noascii_transfer.append({
-                            'relationship_type': rel['relationship_type'],
-                            'source_id': rel['related_node_id'],
-                            'target_id': replacement_id,
-                            'direction': 'incoming'  
-                        })
-
+            relationship_noascii_transfer.extend(self.cacl_missing_rels(main_node= main_relationships,
+                                                                        replacement_node= replacement_relationships, 
+                                                                        replacement_id= replacement_id))
             nodes_delete.append(("", main_id))
         # Execute batch operations
         logger.info("Executing batch label transfers...")
@@ -472,33 +585,9 @@ class GraphPreprocessor:
                     nodes_delete.append(("", value['id']))
                     continue
 
-                main_connected_set = set()
-                for rel in main_rels['outgoing_relationships'] + main_rels['incoming_relationships']:
-                    if rel['related_node_id']:
-                        main_connected_set.add(rel['related_node_id'])
-
-                replacement_connected_set = set()
-                for rel in replacement_rels['outgoing_relationships'] + replacement_rels['incoming_relationships']:
-                    if rel['related_node_id']:
-                        replacement_connected_set.add(rel['related_node_id'])
-
-                missing_connection = main_connected_set - replacement_connected_set
-                for rel in main_rels['outgoing_relationships'] + main_rels['incoming_relationships']:
-                    if rel['related_node_id'] in missing_connection:
-                        if rel['direction'] == 'outgoing':
-                            relationship_ascii_transfer.append({
-                                'relationship_type': rel['relationship_type'],
-                                'source_id': value['replacement_of_the_main_id'],
-                                'target_id': rel['related_node_id'],
-                                'direction': 'outgoing'  
-                                })
-                        else:
-                            relationship_ascii_transfer.append({
-                                'relationship_type': rel['relationship_type'],
-                                'source_id': rel['related_node_id'],
-                                'target_id': value['replacement_of_the_main_id'],
-                                'direction': 'incoming'  
-                            })
+                relationship_ascii_transfer.extend(self.cacl_missing_rels(main_node= main_rels,
+                                                                          replacement_node= replacement_rels,
+                                                                          replacement_id= value['replacement_of_the_main_id']))
                
                 nodes_delete.append(("", value['id']))
                            
@@ -510,7 +599,6 @@ class GraphPreprocessor:
                 replacement_id = value['replacement_of_the_main_id']
 
                 result1 = self.calculate_levenstein_distance(session= session, text= main_id)
-                found_better_replacement = False
 
                 for i in result1:
                     if i['output_score'] == 0 and "_" not in i['value']:
@@ -520,7 +608,6 @@ class GraphPreprocessor:
                         
                         if not bool(result2):
                             nodes_delete.append(("", main_id))
-                            found_better_replacement = True
                             break 
 
                         if not bool(result3):
@@ -530,33 +617,10 @@ class GraphPreprocessor:
                         if value['labels']:
                             label_ascii_transfer.append((value['labels'], replaced_text))
 
+                        relationship_ascii_transfer.extend(self.cacl_missing_rels(  main_node= result2,
+                                                                                    replacement_node= result3,
+                                                                                    replacement_id= value['replacement_of_the_main_id']))
 
-                        main_connected_set = set()
-                        for rel in result2['outgoing_relationships'] + result2['incoming_relationships']:
-                            if rel['related_node_id']:
-                                main_connected_set.add(rel['related_node_id'])
-                        replacement_connected_set = set()
-                        for rel in result3['outgoing_relationships'] + result3['incoming_relationships']:
-                            if rel['related_node_id']:
-                                replacement_connected_set.add(rel['related_node_id'])
-
-                        missing_connection = main_connected_set - replacement_connected_set
-                        for rel in main_rels['outgoing_relationships'] + main_rels['incoming_relationships']:
-                            if rel['related_node_id'] in missing_connection:
-                                if rel['direction'] == 'outgoing':
-                                    relationship_ascii_transfer.append({
-                                        'relationship_type': rel['relationship_type'],
-                                        'source_id': value['replacement_of_the_main_id'],
-                                        'target_id': rel['related_node_id'],
-                                        'direction': 'outgoing'  
-                                        })
-                                else:
-                                    relationship_ascii_transfer.append({
-                                        'relationship_type': rel['relationship_type'],
-                                        'source_id': rel['related_node_id'],
-                                        'target_id': value['replacement_of_the_main_id'],
-                                        'direction': 'incoming'  
-                                    })
                     
                         nodes_delete.append(("", value['id']))
                         break
@@ -569,4 +633,51 @@ class GraphPreprocessor:
         self.transfer_relations_batch(session, relationship_ascii_transfer)
         logger.info("Executing batch node deletions...")
         self.delete_node_batch(session, nodes_delete)
+
+
+    def manual_transfer(self, session: Session,filepath: str = r"data\manual_transfer.json"):
+        with open(filepath, "r") as f:
+            data = json.load(f)
+        nodes_delete = []
+        rels_transfer = []
+        for value in data:
+            main_id = value['value']
+            replacement_id = value['value_can_be_replaced']
+
+            main_relationships = self.find_relationship(session= session, text = main_id)
+            if not main_relationships:
+                nodes_delete.append(("", main_id))
+                continue
+
+            replacement_relationships = self.find_relationship(session= session, text = replacement_id)
+            if not replacement_relationships:
+                continue
+            
+            rels_transfer.extend(self.cacl_missing_rels(main_node= main_relationships,
+                                                        replacement_node= replacement_relationships,
+                                                        replacement_id= replacement_id))
+            nodes_delete.append(("", main_id))
+        self.transfer_relations_batch(session, rels_transfer)
+        logger.info("Executing batch node deletions...")
+        self.delete_node_batch(session, nodes_delete)
+
+
+    def graph_preprocessing(self, session: Session):
+        logger.info("Processing Vietnamese nodes Starting the full processing...")
+        try:
+            logger.info("Step 1: Normalize the labels")
+            self.replace_labels(session= session)
+
+            logger.info("Step 2: Process the non-ASCII underscore nodes")
+            self.process_nodes_non_ascii_underscore(session= session)
+
+            logger.info("Step 3: Process the ASCII underscore nodes")
+            self.process_nodes__ascii_underscore(session= session)
+
+            # logger.info("Step 4: Manual transfer")
+            # self.manual_transfer(session= session)
+
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
+
 

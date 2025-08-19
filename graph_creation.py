@@ -1,5 +1,5 @@
-from typing import Iterable, Optional, List, Generator
-from neo4j import GraphDatabase, Driver
+from typing import Iterable, Optional, List, Generator, Dict, Any
+from neo4j import GraphDatabase, Driver, Session 
 
 from langchain.schema import Document
 from langchain_experimental.graph_transformers import LLMGraphTransformer
@@ -92,6 +92,19 @@ def process_documents_to_graph(chunks: Iterable[Document], llm_transformer: LLMG
             print(f"Processed final batch")
         except Exception as e:
             print("Error processing final batch: ", e)
+
+# Create node manually if fail
+def create_node(session: Session, value: Dict[str, Any]):
+    label = value['labels'][0]
+    text = value['text']
+    summary = value['summary']
+    id = value['id']
+    title = value['title']
+
+    default_cypher = f'''
+    CREATE (n:{label} {{id: "{id}", text: "{text}", title: "{title}", summary: "{summary}" }})
+    '''
+    session.run(default_cypher)
 
 
 if __name__ == "__main__":
