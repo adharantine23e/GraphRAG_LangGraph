@@ -1,6 +1,9 @@
 from typing import Literal, List, Dict, Any, Tuple, TypedDict
 import json
 import re
+import sqlite3
+import hashlib
+from enum import Enum
 from itertools import combinations
 from langchain.graphs import Neo4jGraph
 from langchain_neo4j.vectorstores.neo4j_vector import remove_lucene_chars
@@ -57,7 +60,7 @@ class EntityExtractionAgent:
             entities = entities.get('entities', [])
             state['entities'] = entities
             state['curr_agent'] = "entity_extraction_agent"
-
+            WorkflowMonitor.print_state(state)
         except Exception as e:
             print(f"Error in entity extraction agent: {e}")
             state['entities'] = []
@@ -106,11 +109,13 @@ class GraphRetrievalAgent:
                 result = "No structured data found"
             # For the case when there is only one entity
             elif len(entities) == 1:
-                for entity in entities:
-                    entity_results = self.autimatum_query(input_entity= entity, limit = 10)
-                    if entity_results:
-                        result += f"\nRelationship related to entity: {entity}\n"
-                        result += "\n".join(entity_results) + "\n"
+                entity = entities[0]
+                entity_results = self.autimatum_query(input_entity= entity, limit = 10)
+                if entity_results:
+                    result += f"\nRelationship related to entity: {entity}\n"
+                    result += "\n".join(entity_results) + "\n"
+                else:
+                    print("You stupid")
             
             # For the case when there are multiple entities
             else:
@@ -141,22 +146,38 @@ class GraphRetrievalAgent:
                         for record in records:
                             relationships = record['rels']
                             for rel in relationships:
-                                node_lst = []
-                                for node in rel.nodes:
-                                    id_node = node["id"]
+                                
 
-                                    # Test if the node has the id of the document
-                                    is_letter = bool(re.search(r'[a-zA-Z]', id_node))
-                                    is_num = bool(re.search(r"\d", id_node))
-                                    if is_letter and is_num:
-                                        node_lst.append(node['title'])
-                                    else:
-                                        node_lst.append(node['id'])
-                                format_txt = f"{node_lst[0]} -[:{rel.type}]-> {node_lst[1]}"
+                                # This is for GraphDataBase
+                                # node_lst = []
+                                # for node in rel.nodes:
+                                #     id_node = node["id"]
+
+                                #     # Test if the node has the id of the document
+                                #     is_letter = bool(re.search(r'[a-zA-Z]', id_node))
+                                #     is_num = bool(re.search(r"\d", id_node))
+                                #     if is_letter and is_num and "title" in node:
+                                #         node_lst.append(node['title'])
+                                #     else:
+                                #         node_lst.append(node['id'])
+
+                                # This is for Neo4jGraph
+                                
+                                first_node = rel[0].get("id", "")
+                                is_letter = bool(re.search(r'[a-zA-Z]', first_node))
+                                is_num = bool(re.search(r"\d", first_node))
+                                if is_letter and is_num and "title" in rel[0]:
+                                    first_node = rel[0].get("title", "")
+                                rel_type = rel[1]
+                                second_node = rel[2].get("id", "")
+
+                                format_txt = f"{first_node} -[:{rel_type}]-> {second_node}"
                                 relationships_lst.append(format_txt)
                         result += "\n".join(relationships_lst) + "\n"
             state['structured_data'] = result
             state['curr_agent'] = "graph_retrieval_agent"
+            print("The final result of the graph retrieval agent: ", result)
+            WorkflowMonitor.print_state(state)
         except Exception as e:
             print(f"Error in graph retrieval agent: {e}")
 
