@@ -1,29 +1,44 @@
-from typing import Literal, List, Dict, Any, Tuple, TypedDict
+from typing import Literal, List, Dict, Any, Tuple, TypedDict, Optional
 import json
 import re
 import sqlite3
 import hashlib
-from enum import Enum
+import uuid
+import datetime
+import time
+import hashlib
+from dataclasses import dataclass
 from itertools import combinations
 from langchain.graphs import Neo4jGraph
 from langchain_neo4j.vectorstores.neo4j_vector import remove_lucene_chars
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_core.prompts import PromptTemplate
 from langchain_google_genai import GoogleGenerativeAI
-from langgraph.graph import END, START, StateGraph, MessagesState
+from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
-from neo4j import Driver
+from langgraph.checkpoint.memory import InMemorySaver
 
 class GraphRAGState(TypedDict):
+    processing_start_time: float
     question: str
     chat_history: List[Tuple[str, str]]
     entities: List[str]
     structured_data: str
     relevant_documents: List[str]
+    final_prompt: str
     final_answer: str
     curr_agent: str
 
+@dataclass
+class PatientInteraction:
+    id: str
+    timestamp: str
+    question: str
+    prompt: str
+    chatcbot_answers: str
+    processing_time: float
+    success: bool
+    error_message: Optional[str] = None
 
 # Agent 1: Extract entities from patient question
 class EntityExtractionAgent:
@@ -242,7 +257,8 @@ class AnswerGenerationAgent:
             )
             response = self.llm.invoke(prompt)
             final_answer = response.content
-
+            
+            state["final_prompt"] = prompt
             state["final_answer"] = final_answer
             state["curr_agent"] = "answer_generation_agent"
 
@@ -253,9 +269,128 @@ class AnswerGenerationAgent:
         
         return state
 
+# Log the patient interation with the chatbot
+class QuestionLogger:
+    def __init__(self, db_path: str = r"data\logger_interaction.db"):
+        self.db_path = db_path
+        self.init_database()
+    def init_database(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Create the main table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS patient_interaction (
+            id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            patient_ques TEXT NOT NULL,
+            patient_ques_hash TEXT NOT NULL,
+            chatbot_ans TEXT NOT NULL,
+            input_prompt TEXT NOT NULL,
+            success BOOLEAN,
+            error_message TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )               
+        """)
+
+        # Create table for frequent question
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS frequent_question (
+            question_hash TEXT PRIMARY KEY,
+            count INTEGER DEFAULT 1,
+            first_asked TEXT,
+            last_asked TEXT
+        )
+        """)
+
+        # Create index
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_time ON patient_interaction (timestamp)
+        """)
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_question ON patient_interaction (patient_ques_hash)
+        """)
+        conn.commit()
+        conn.close()
+
+    def generate_question_hash(self, question: str) -> str:
+        normalized = " ".join(question.lower().split())
+        return hashlib.md5(normalized.encode()).hexdigest()
+
+    def log_question(self, state: GraphRAGState, processing_time: float) -> GraphRAGState:
+        try:
+            question = state['question']
+            id = str(uuid.uuid4())
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            question_hash = self.generate_question_hash(question = question)
+
+            log = PatientInteraction(
+                id = id,
+                timestamp= timestamp,
+                question= question,
+                prompt= state["final_prompt"],
+                chatcbot_answers= state["final_answer"],
+                processing_time= processing_time,
+                success= bool(state["final_answer"].strip()),
+                error_message= None
+            )
+        
+            self.save_to_database(log = log, question_hash= question_hash)
+            self.update_frequent_question(question_hash= question_hash)
+
+            state['curr_agent'] = "data_logger"
+        except Exception as e:
+            print(f"Error in logging question: {e}")
+        
+
+    def save_to_database(self, log: PatientInteraction, question_hash: str):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+        INSERT INTO patient_interaction
+        (id, timestamp, patient_ques, patient_ques_hash, chatbot_ans, input_prompt)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            log.id,
+            log.timestamp,
+            log.question,
+            question_hash,
+            log.chatcbot_answers,
+            log.prompt
+        ))
+
+        conn.commit()
+        conn.close()
+    
+    def update_frequent_question(self, question_hash: str):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+        SELECT count FROM frequent_question WHERE question_hash = ?""", (question_hash,))
+        result = cursor.fetchone()
+        curr_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if result:
+            count = result
+            new_count += 1
+            # Set the new reocord
+            cursor.execute("""
+            UPDATE frequent_question SET count = ?, last_asked = ? WHERE question_hash = ?
+            """, (new_count, curr_time, question_hash))
+        else:
+            # Insert new record
+            cursor.execute("""
+            INSERT INTO frequent_question (question_hash, count, first_asked, last_asked)
+            VALUES (?, 1, ?, ?)
+            """, (question_hash, curr_time, curr_time))
+
+        conn.commit()
+        conn.close()
+
+
 class WorkflowMonitor:
     """Monitor and debug the workflow execution"""
-    
     @staticmethod
     def print_state(state: GraphRAGState):
         """Print current state for debugging"""
@@ -270,10 +405,11 @@ class WorkflowMonitor:
 
 
 class GraphRAGWorkflow:
-    def __init__(self, llm, graph, vector_idx):
+    def __init__(self, llm, graph, vector_idx, db_path: str = r"data\logger_interaction.db"):
         self.llm = llm
         self.graph = graph
         self.vector_idx = vector_idx
+        self.logger = QuestionLogger(db_path= db_path)
 
         # Initialize agents
         self.entity_extraction_agent = EntityExtractionAgent(llm=llm)
@@ -282,14 +418,21 @@ class GraphRAGWorkflow:
         self.answer_generation_agent = AnswerGenerationAgent(llm=llm)
         self.workflow = self.workflow()
 
-    def workflow(self):
-        graph_builder = StateGraph(GraphRAGState)
+    def logging(self, state: GraphRAGState) -> GraphRAGState:
+        processing_time = time.time() - state.get('processing_start_time', 0)
+        return self.logger.log_question(state= state, processing_time= processing_time)
 
+
+    def workflow(self):
+        checkpointer = InMemorySaver()
+        graph_builder = StateGraph(GraphRAGState)
+        
         # Add nodes
         graph_builder.add_node("entity_extraction_agent", self.entity_extraction_agent.extract_entities)
         graph_builder.add_node("graph_retrieval_agent", self.graph_retrieval_agent.retrieve_structured_data)
         graph_builder.add_node("document_retrieval_agent", self.document_retrieval_agent.retrieve_relevant_documents)
         graph_builder.add_node("answer_generation_agent", self.answer_generation_agent.generate_answer)
+        graph_builder.add_node("data_logger", self.logging)
 
         graph_builder.set_entry_point("entity_extraction_agent")
 
@@ -297,18 +440,21 @@ class GraphRAGWorkflow:
         graph_builder.add_edge("entity_extraction_agent", "graph_retrieval_agent")
         graph_builder.add_edge("graph_retrieval_agent", "document_retrieval_agent")
         graph_builder.add_edge("document_retrieval_agent", "answer_generation_agent")
-        graph_builder.add_edge("answer_generation_agent", END)
-        return graph_builder.compile()
+        graph_builder.add_edge("answer_generation_agent", "data_logger")
+        graph_builder.add_edge("data_logger", END)
+        return graph_builder.compile(checkpointer= checkpointer)
         
     def process_question(self, question: str, debug_mode: bool, chat_history: List[Tuple[str, str]] = None) -> str:
         
         # Initialize state
         initiate_state = GraphRAGState(
+            processing_start_time= time.time(),
             question= question,
             chat_history= chat_history or [],
             entities= [],
             structured_data= "",
             relevant_documents= [],
+            final_prompt = "",
             final_answer=  "",
             curr_agent= ""
         )
@@ -316,6 +462,6 @@ class GraphRAGWorkflow:
             print(self.workflow.get_graph().draw_ascii())
         else:
             # Run the workflow 
-            final_state = self.workflow.invoke(initiate_state)
+            final_state = self.workflow.invoke(initiate_state, config = {"configurable": {"thread_id": "1"}})
             return final_state['final_answer']
     
