@@ -13,13 +13,15 @@ from langchain.graphs import Neo4jGraph
 from langchain_neo4j.vectorstores.neo4j_vector import remove_lucene_chars
 from langchain_core.tools import tool
 from langchain_core.prompts import PromptTemplate
-from langchain_google_genai import GoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
 
 class GraphRAGState(TypedDict):
     processing_start_time: float
+    user_context: str
+    user_id: str
     question: str
     chat_history: List[Tuple[str, str]]
     entities: List[str]
@@ -40,13 +42,23 @@ class PatientInteraction:
     success: bool
     error_message: Optional[str] = None
 
+
+def route_to_simple(state: GraphRAGState) -> Literal["graph_retrieval_agent", "simple_agent"]:
+    entities = state.get('entities', [])
+    if not entities:
+        return "simple_agent"
+    return "graph_retrieval_agent"
+
 # Agent 1: Extract entities from patient question
 class EntityExtractionAgent:
     def __init__(self, llm):
         self.llm = llm
         self.prompt = PromptTemplate.from_template("""
         Bạn là một chuyên viên y tế với nhiệm vụ là trích xuất các thực thể y tế quan trọng từ câu hỏi bệnh nhân.
-
+        
+        Thông tin từ lịch sử hội thoại của bệnh nhân:
+        {user_context}
+                                                   
         Các thực thể y tế có thể bao gồm:
             - Tên bệnh, triệu chứng bệnh
             - Thuốc 
@@ -66,7 +78,8 @@ class EntityExtractionAgent:
 
     def extract_entities(self, state: GraphRAGState) -> GraphRAGState:
         try:
-            prompt = self.prompt.format(question= state['question'])
+            user_context = state.get('user_context', '')
+            prompt = self.prompt.format(question= state['question'], user_context= user_context)
             response = self.llm.invoke(prompt)
 
             # Parse the JSON response
@@ -79,7 +92,6 @@ class EntityExtractionAgent:
         except Exception as e:
             print(f"Error in entity extraction agent: {e}")
             state['entities'] = []
-        
         return state
 
 class GraphRetrievalAgent:
@@ -388,6 +400,103 @@ class QuestionLogger:
         conn.commit()
         conn.close()
 
+class SimpleAgent:
+    def __init__(self, llm):
+        self.llm = llm
+        self.prompt = PromptTemplate.from_template("""
+        Bạn là một trợ lý sức khỏe thân thiện. Bệnh nhân đã hỏi một câu hỏi không liên quan trực tiếp đến y tế 
+        hoặc không chứa các thực thể y tế cụ thể.
+        
+        Thông tin từ lịch sử hội thoại của bệnh nhân:
+        {user_context}
+        
+        Câu hỏi của bệnh nhân:
+        {question}
+        
+        Hướng dẫn:
+        1. Trả lời một cách lịch sự và hữu ích
+        2. Nếu câu hỏi có thể liên quan đến sức khỏe một cách gián tiếp, hãy cung cấp lời khuyên chung
+        3. Khuyến khích họ hỏi các câu hỏi cụ thể về sức khỏe nếu cần
+        4. Giữ tông giọng thân thiện và chuyên nghiệp
+        5. Nếu câu hỏi hoàn toàn ngoài phạm vi y tế, hãy lịch sự chuyển hướng
+        
+        Câu trả lời:
+        """)
+    def give_answer(self, state: GraphRAGState) -> GraphRAGState:
+        try:
+            user_context = state.get('user_context', '')
+            question = state['question']
+            prompt = self.prompt.format(user_context= user_context, question= question)
+            
+            answer = self.llm.invoke(prompt)
+            state['curr_agent'] = "simple_agent"
+            state["final_prompt"] = prompt
+            state['final_answer'] = answer.content
+            WorkflowMonitor.print_state(state)      
+        except Exception as e:
+            print(f"Error in simple agent: {e}")
+            state['final_answer'] = "Không tìm được câu trả lời"
+        return state
+
+class MemoryAgent:
+    def __init__(self, store: InMemoryStore):
+        self.store = store
+    
+    def load_user_context(self, state: GraphRAGState) -> GraphRAGState:
+        """Load minimal user context from previous conversations"""
+        try:
+            user_id = state.get('user_id', '')
+            if not user_id:
+                state['user_context'] = ""
+                return state
+            
+            results = self.store.search(["conversations"], query=user_id)
+            
+            # Get last 3 conversations for context
+            recent_conversations = []
+            for item in results[-3:] if results else []:
+                conv_data = item.value
+                recent_conversations.append(f"Q: {conv_data['question'][:100]}... A: {conv_data['answer'][:100]}...")
+            
+            user_context = "\n".join(recent_conversations) if recent_conversations else "Không có lịch sử hội thoại."
+            state['user_context'] = user_context
+            state['curr_agent'] = "memory_load"
+            
+        except Exception as e:
+            print(f"Error loading user context: {e}")
+            state['user_context'] = ""
+        return state
+    
+    def store_conversation(self, state: GraphRAGState) -> GraphRAGState:
+        """Store current conversation for future reference"""
+        try:
+            user_id = state.get('user_id', '')
+            if not user_id:
+                return state
+            
+            # Create simple conversation record
+            conversation_data = {
+                'user_id': user_id,
+                'question': state['question'],
+                'answer': state['final_answer'],
+                'entities': state.get('entities', []),
+                'timestamp': datetime.datetime.now().isoformat()
+            }
+            
+            # Store with timestamp as key
+            conversation_key = f"{user_id}_{int(time.time())}"
+            self.store.put(
+                namespace="conversations",
+                key=conversation_key,
+                value=conversation_data
+            )
+            
+            state['curr_agent'] = "memory_store"
+            
+        except Exception as e:
+            print(f"Error storing conversation: {e}")
+        
+        return state
 
 class WorkflowMonitor:
     """Monitor and debug the workflow execution"""
@@ -396,13 +505,14 @@ class WorkflowMonitor:
         """Print current state for debugging"""
         print(f"\n{'='*50}")
         print(f"Current Agent: {state.get('curr_agent', 'Unknown')}")
+        print(f"User ID: {state.get('user_id', 'No user')}")
         print(f"Question: {state.get('question', '')[:100]}...")
         print(f"Entities: {state.get('entities', [])}")
+        print(f"User Context Length: {len(state.get('user_context', ''))}")
         print(f"Structured Data Length: {len(state.get('structured_data', ''))}")
         print(f"Documents Count: {len(state.get('relevant_documents', []))}")
         print(f"Answer Length: {len(state.get('final_answer', ''))}")
         print(f"{'='*50}\n")
-
 
 class GraphRAGWorkflow:
     def __init__(self, llm, graph, vector_idx, db_path: str = r"data\logger_interaction.db"):
@@ -410,12 +520,15 @@ class GraphRAGWorkflow:
         self.graph = graph
         self.vector_idx = vector_idx
         self.logger = QuestionLogger(db_path= db_path)
+        self.store = InMemoryStore()
 
         # Initialize agents
+        self.simple_agent = SimpleAgent(llm=llm)
         self.entity_extraction_agent = EntityExtractionAgent(llm=llm)
         self.graph_retrieval_agent = GraphRetrievalAgent(graph=graph)
         self.document_retrieval_agent = DocumentRetrievalAgent(vector_idx=vector_idx)
         self.answer_generation_agent = AnswerGenerationAgent(llm=llm)
+        self.memory_agent = MemoryAgent(store=self.store)
         self.workflow = self.workflow()
 
     def logging(self, state: GraphRAGState) -> GraphRAGState:
@@ -428,40 +541,62 @@ class GraphRAGWorkflow:
         graph_builder = StateGraph(GraphRAGState)
         
         # Add nodes
+        graph_builder.add_node("memory_load", self.memory_agent.load_user_context)
+        graph_builder.add_node("simple_agent", self.simple_agent.give_answer)
         graph_builder.add_node("entity_extraction_agent", self.entity_extraction_agent.extract_entities)
         graph_builder.add_node("graph_retrieval_agent", self.graph_retrieval_agent.retrieve_structured_data)
         graph_builder.add_node("document_retrieval_agent", self.document_retrieval_agent.retrieve_relevant_documents)
         graph_builder.add_node("answer_generation_agent", self.answer_generation_agent.generate_answer)
+        graph_builder.add_node("memory_store", self.memory_agent.store_conversation)
         graph_builder.add_node("data_logger", self.logging)
 
-        graph_builder.set_entry_point("entity_extraction_agent")
+        graph_builder.set_entry_point("memory_load")
 
         # First set a sequential flow of the agents
-        graph_builder.add_edge("entity_extraction_agent", "graph_retrieval_agent")
+        graph_builder.add_edge("memory_load", "entity_extraction_agent")
+        graph_builder.add_conditional_edges(
+            "entity_extraction_agent",
+            route_to_simple,
+            {
+                "graph_retrieval_agent": "graph_retrieval_agent",
+                "simple_agent": "simple_agent"
+            }
+        )
         graph_builder.add_edge("graph_retrieval_agent", "document_retrieval_agent")
         graph_builder.add_edge("document_retrieval_agent", "answer_generation_agent")
-        graph_builder.add_edge("answer_generation_agent", "data_logger")
+        graph_builder.add_edge("answer_generation_agent", "memory_store")
+        graph_builder.add_edge("simple_agent", "memory_store")
+        graph_builder.add_edge("memory_store", "data_logger")
         graph_builder.add_edge("data_logger", END)
-        return graph_builder.compile(checkpointer= checkpointer)
+        return graph_builder.compile(checkpointer= checkpointer, store= self.store)
         
-    def process_question(self, question: str, debug_mode: bool, chat_history: List[Tuple[str, str]] = None) -> str:
+    def process_question(self, question: str, user_id: str, debug_mode: bool = False, 
+                        chat_history: List[Tuple[str, str]] = None) -> str:
+        """Process question with minimal long-term memory"""
         
-        # Initialize state
-        initiate_state = GraphRAGState(
-            processing_start_time= time.time(),
-            question= question,
-            chat_history= chat_history or [],
-            entities= [],
-            structured_data= "",
-            relevant_documents= [],
-            final_prompt = "",
-            final_answer=  "",
-            curr_agent= ""
+        # Initialize state with user_id for memory tracking
+        initial_state = GraphRAGState(
+            processing_start_time=time.time(),
+            question=question,
+            user_id=user_id,
+            user_context="",
+            chat_history=chat_history or [],
+            entities=[],
+            structured_data="",
+            relevant_documents=[],
+            final_prompt="",
+            final_answer="",
+            curr_agent=""
         )
+        
         if debug_mode:
             print(self.workflow.get_graph().draw_ascii())
-        else:
-            # Run the workflow 
-            final_state = self.workflow.invoke(initiate_state, config = {"configurable": {"thread_id": "1"}})
-            return final_state['final_answer']
+        
+        # Run the workflow with user-specific thread
+        final_state = self.workflow.invoke(
+            initial_state, 
+            config={"configurable": {"thread_id": user_id}}
+        )
+        
+        return final_state['final_answer']
     
