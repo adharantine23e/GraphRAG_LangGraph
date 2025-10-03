@@ -106,7 +106,6 @@ def levenshtein_distance(s1: str, s2: str) -> int:
 
     return previous_row[len(s2)]
 
-
 class GraphPreprocessor:
     def __init__(self, driver: GraphDatabase.driver):
         self.driver = driver
@@ -128,6 +127,9 @@ class GraphPreprocessor:
             return contents.split("\n")
 
     def find_nodes_(self, session: Session) -> Tuple[List[Dict], List[Dict]]:
+        '''
+        Find nodes with non-ASCII and ASCII context
+        '''
         default_cypher ='''
         MATCH (n)
         WHERE n.id CONTAINS "_"
@@ -231,7 +233,7 @@ class GraphPreprocessor:
                 
                 session.run(combined_query)
 
-    def replace_nodes(self, session: Session, data):
+    def replace_nodes(self, session: Session, data: List[str]):
         for value in data:
 
             default_cypher = f'''MATCH (n)

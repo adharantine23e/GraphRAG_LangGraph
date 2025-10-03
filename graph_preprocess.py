@@ -1,5 +1,5 @@
 from neo4j import GraphDatabase
-from graph_utils import *
+from graph_utils import GraphPreprocessor
 import os
 
 driver = GraphDatabase.driver(

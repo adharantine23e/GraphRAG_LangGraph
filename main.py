@@ -1,15 +1,14 @@
 import gradio as gr
 import json
 import time
-from typing import Dict, List, Tuple, Any
+from typing import Dict, Any
 from dataclasses import asdict
-import pandas as pd
 import os
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Neo4jVector
 from langchain.graphs import Neo4jGraph
-from chatbot import GraphRAGWorkflow, GraphRAGState
+from chatbot import GraphRAGWorkflow
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
@@ -347,13 +346,8 @@ def create_gradio_interface(workflow: GraphRAGWorkflow):
     
     return demo
 
-# Usage example
 def main():
     """Main function to run the Gradio interface"""
-    
-    # You need to initialize your workflow here
-    # This is just a placeholder - replace with your actual workflow initialization
-    
     try:
         # Initialize your components (replace with actual initialization)
         base_model_name = 'keepitreal/vietnamese-sbert'
@@ -376,6 +370,7 @@ def main():
                                                 model_kwargs = model_kwargs,
                                                 encode_kwargs = encode_kwargs)
 
+        # Initialize vector search based mode label: Document and text and embedding created in Neo4j
         vector_index = Neo4jVector.from_existing_graph(
             model_embedding,
             search_type="hybrid",
