@@ -7,11 +7,14 @@ from langchain_groq import ChatGroq
 from langchain_community.graphs import Neo4jGraph
 
 from underthesea import word_tokenize
-import os 
+import os
 import re
 import json
+from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(override= True)
+
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 def format_data(path_data: str) -> Iterable:
     """Load JSON data with fallback."""
@@ -109,7 +112,7 @@ def create_node(session: Session, value: Dict[str, Any]):
 
 if __name__ == "__main__":
     # Initialize
-    filepath = r"data\WikiHow_concatenated_fixed_4.json"
+    filepath = str(DATA_DIR / "WikiHow_concatenated_fixed_4.json")
     llm_graph = ChatGroq(temperature = 0, model="gemma2-9b-it")
     llm_transformer = LLMGraphTransformer(llm_graph)    
     graph = Neo4jGraph(

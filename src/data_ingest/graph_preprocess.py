@@ -1,6 +1,10 @@
 from neo4j import GraphDatabase
-from graph_utils import GraphPreprocessor
 import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from src.utils.graph_utils import GraphPreprocessor
 
 driver = GraphDatabase.driver(
             os.environ["NEO4J_URI"],

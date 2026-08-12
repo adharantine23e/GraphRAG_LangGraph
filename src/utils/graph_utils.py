@@ -1,12 +1,15 @@
-import os 
+import os
 import re
 import json
 import pandas as pd
+from pathlib import Path
 from unidecode import unidecode
 from typing import List, Any, Dict, Tuple
 from neo4j import GraphDatabase, Session
 import logging
 from contextlib import contextmanager
+
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -121,7 +124,7 @@ class GraphPreprocessor:
             session.close()
 
 
-    def load_list_except_ascii(self, path: str = r"data\exception_underscore_ascii.txt") -> List[str]:
+    def load_list_except_ascii(self, path: str = str(DATA_DIR / "exception_underscore_ascii.txt")) -> List[str]:
         with open(path, "r") as f:
             contents = f.read()
             return contents.split("\n")
@@ -637,7 +640,7 @@ class GraphPreprocessor:
         self.delete_node_batch(session, nodes_delete)
 
 
-    def manual_transfer(self, session: Session,filepath: str = r"data\manual_transfer.json"):
+    def manual_transfer(self, session: Session,filepath: str = str(DATA_DIR / "manual_transfer.json")):
         with open(filepath, "r") as f:
             data = json.load(f)
         nodes_delete = []

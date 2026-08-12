@@ -8,7 +8,12 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Neo4jVector
 from langchain.graphs import Neo4jGraph
-from chatbot import GraphRAGWorkflow
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.agents.chatbot import GraphRAGWorkflow
 from dotenv import load_dotenv
 load_dotenv(override=True)
 

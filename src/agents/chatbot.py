@@ -7,9 +7,10 @@ import uuid
 import datetime
 import time
 import hashlib
+from pathlib import Path
 from dataclasses import dataclass
 from itertools import combinations
-from langchain.graphs import Neo4jGraph
+from langchain_neo4j import Neo4jGraph
 from langchain_neo4j.vectorstores.neo4j_vector import remove_lucene_chars
 from langchain_core.tools import tool
 from langchain_core.prompts import PromptTemplate
@@ -18,29 +19,13 @@ from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
 
-class GraphRAGState(TypedDict):
-    processing_start_time: float
-    user_context: str
-    user_id: str
-    question: str
-    chat_history: List[Tuple[str, str]]
-    entities: List[str]
-    structured_data: str
-    relevant_documents: List[str]
-    final_prompt: str
-    final_answer: str
-    curr_agent: str
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-@dataclass
-class PatientInteraction:
-    id: str
-    timestamp: str
-    question: str
-    prompt: str
-    chatcbot_answers: str
-    processing_time: float
-    success: bool
-    error_message: Optional[str] = None
+from src.schemas.state import GraphRAGState, PatientInteraction
+from src.memory.short_term import ShortTermMemory
+
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 
 def route_to_simple(state: GraphRAGState) -> Literal["graph_retrieval_agent", "simple_agent"]:
@@ -283,7 +268,7 @@ class AnswerGenerationAgent:
 
 # Log the patient interation with the chatbot
 class QuestionLogger:
-    def __init__(self, db_path: str = r"data\logger_interaction.db"):
+    def __init__(self, db_path: str = str(DATA_DIR / "logger_interaction.db")):
         self.db_path = db_path
         self.init_database()
     def init_database(self):
@@ -439,9 +424,16 @@ class SimpleAgent:
         return state
 
 class MemoryAgent:
-    def __init__(self, store: InMemoryStore):
+    """Short-term conversational memory.
+
+    Backed by ShortTermMemory (Redis, exact-keyed by user_id) when a redis_client
+    was supplied to GraphRAGWorkflow; otherwise falls back to the original
+    in-process InMemoryStore behavior (used by the Gradio dev tool).
+    """
+    def __init__(self, store: InMemoryStore = None, short_term_memory: ShortTermMemory = None):
         self.store = store
-    
+        self.short_term_memory = short_term_memory
+
     def load_user_context(self, state: GraphRAGState) -> GraphRAGState:
         """Load minimal user context from previous conversations"""
         try:
@@ -449,31 +441,46 @@ class MemoryAgent:
             if not user_id:
                 state['user_context'] = ""
                 return state
-            
+
+            if self.short_term_memory is not None:
+                state['user_context'] = self.short_term_memory.load_context(user_id)
+                state['curr_agent'] = "memory_load"
+                return state
+
             results = self.store.search(["conversations"], query=user_id)
-            
+
             # Get last 3 conversations for context
             recent_conversations = []
             for item in results[-3:] if results else []:
                 conv_data = item.value
                 recent_conversations.append(f"Q: {conv_data['question'][:100]}... A: {conv_data['answer'][:100]}...")
-            
+
             user_context = "\n".join(recent_conversations) if recent_conversations else "Không có lịch sử hội thoại."
             state['user_context'] = user_context
             state['curr_agent'] = "memory_load"
-            
+
         except Exception as e:
             print(f"Error loading user context: {e}")
             state['user_context'] = ""
         return state
-    
+
     def store_conversation(self, state: GraphRAGState) -> GraphRAGState:
         """Store current conversation for future reference"""
         try:
             user_id = state.get('user_id', '')
             if not user_id:
                 return state
-            
+
+            if self.short_term_memory is not None:
+                self.short_term_memory.store_turn(
+                    user_id=user_id,
+                    question=state['question'],
+                    answer=state['final_answer'],
+                    entities=state.get('entities', []),
+                )
+                state['curr_agent'] = "memory_store"
+                return state
+
             # Create simple conversation record
             conversation_data = {
                 'user_id': user_id,
@@ -482,7 +489,7 @@ class MemoryAgent:
                 'entities': state.get('entities', []),
                 'timestamp': datetime.datetime.now().isoformat()
             }
-            
+
             # Store with timestamp as key
             conversation_key = f"{user_id}_{int(time.time())}"
             self.store.put(
@@ -490,12 +497,12 @@ class MemoryAgent:
                 key=conversation_key,
                 value=conversation_data
             )
-            
+
             state['curr_agent'] = "memory_store"
-            
+
         except Exception as e:
             print(f"Error storing conversation: {e}")
-        
+
         return state
 
 class WorkflowMonitor:
@@ -515,12 +522,17 @@ class WorkflowMonitor:
         print(f"{'='*50}\n")
 
 class GraphRAGWorkflow:
-    def __init__(self, llm, graph, vector_idx, db_path: str = r"data\logger_interaction.db"):
+    def __init__(self, llm, graph, vector_idx, db_path: str = str(DATA_DIR / "logger_interaction.db"),
+                 redis_client=None):
+        """
+        redis_client: optional sync redis.Redis instance. When supplied, MemoryAgent
+        uses Redis-backed ShortTermMemory (production API path) instead of the
+        in-process InMemoryStore (Gradio dev-tool default when omitted).
+        """
         self.llm = llm
         self.graph = graph
         self.vector_idx = vector_idx
         self.logger = QuestionLogger(db_path= db_path)
-        self.store = InMemoryStore()
 
         # Initialize agents
         self.simple_agent = SimpleAgent(llm=llm)
@@ -528,7 +540,14 @@ class GraphRAGWorkflow:
         self.graph_retrieval_agent = GraphRetrievalAgent(graph=graph)
         self.document_retrieval_agent = DocumentRetrievalAgent(vector_idx=vector_idx)
         self.answer_generation_agent = AnswerGenerationAgent(llm=llm)
-        self.memory_agent = MemoryAgent(store=self.store)
+
+        if redis_client is not None:
+            self.store = InMemoryStore()  # still required by StateGraph.compile(store=...)
+            self.memory_agent = MemoryAgent(short_term_memory=ShortTermMemory(redis_client))
+        else:
+            self.store = InMemoryStore()
+            self.memory_agent = MemoryAgent(store=self.store)
+
         self.workflow = self.workflow()
 
     def logging(self, state: GraphRAGState) -> GraphRAGState:
